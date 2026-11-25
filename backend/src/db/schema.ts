@@ -106,6 +106,11 @@ export const providerProfiles = sqliteTable("provider_profiles", {
    * shop as not taking bookings and `holdSlot` refuses a new hold; existing
    * bookings, locks, releases and disputes are untouched. */
   bookingsPaused: integer("bookings_paused", { mode: "boolean" }).notNull().default(false),
+  /** Admin suspension: nullable, so every pre-existing profile is simply
+   * not suspended. UTC epoch milliseconds. */
+  suspendedAt: integer("suspended_at"),
+  /** The reason for the last suspension, nullable. */
+  suspensionReason: text("suspension_reason"),
   /** Increases only on the chain's `released` event (FR20); never written
    * by hand outside the event worker's own bookkeeping. */
   verifiedSessionCount: integer("verified_session_count").notNull().default(0),
@@ -462,6 +467,10 @@ export const bookings = sqliteTable("bookings", {
    * never cleared. When null and appointment is within 24h, reminder is
    * shown to provider. */
   providerReminderShownAt: integer("provider_reminder_shown_at"),
+  /** Issue #77: a short late note (up to 140 chars) the shop sets on a
+   * locked booking. The client sees it on the booking; it never appears on
+   * the public profile. Clearing the note removes it. */
+  lateNote: text("late_note"),
 
   /** Story 3.8: private note left by the client on this booking (up to 500 chars). Visible on the booking detail page to the shop and the client, never on the public profile or discovery. */
   note: text("note"),
@@ -842,6 +851,8 @@ export const savedShops = sqliteTable(
   },
   (table) => [unique().on(table.clientWalletAddress, table.providerProfileId)],
 );
+
+/**
  * Shop reports: a signed-in client can report a shop listing to admins.
  * One report per client per shop per day. Does not change the shop's status.
  */
@@ -881,3 +892,17 @@ export const waitlistEntries = sqliteTable(
 );
 
 export type WaitlistEntryRow = typeof waitlistEntries.$inferSelect;
+
+/**
+ * Issue #7: one row per escrow contract id a deploy ever returned for a
+ * booking. Deliberately never read by anything that moves money.
+ */
+export const escrowContractDeployments = sqliteTable("escrow_contract_deployments", {
+  bookingId: text("booking_id")
+    .notNull()
+    .references(() => bookings.id),
+  contractId: text("contract_id").notNull(),
+  deployedAt: integer("deployed_at").notNull(),
+}, (table) => [primaryKey({ columns: [table.bookingId, table.contractId] })]);
+
+export type EscrowContractDeploymentRow = typeof escrowContractDeployments.$inferSelect;

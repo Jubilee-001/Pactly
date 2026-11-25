@@ -21,6 +21,7 @@ import {
   listApprovedProviderProfiles,
   listApprovedProviderProfilesForDiscover,
   setProviderProfileBookingsPaused,
+  setProviderProfileSuspension,
   updateProviderProfileRules,
   updateProviderProfileText as persistProviderProfileText,
   type ProviderProfileRow,
@@ -31,10 +32,13 @@ import {
   replaceFutureSlots,
   type AvailabilitySlotRow,
 } from "../db/availabilitySlots.js";
+import { listProviderBreaks, replaceProviderBreaks } from "../db/providerBreaks.js";
 import { getCategoryById, getCategoryBySlug, listCategories, listVisibleCategories, type CategoryRow } from "../db/categories.js";
 import type { Db } from "../db/client.js";
-import { listEarliestOfferedSlotsByProvider, listOfferedSlots } from "./availability.js";
+import { listEarliestOfferedSlotsByProvider, listOfferedSlots, filterSlotsOutsideBreaks, validateBreaks, workingRangesForSlots, assertBreaksWithinRanges } from "./availability.js";
+import { buildPublicHours } from "./publicHours.js";
 import { isWithinBookingWindow } from "./bookingWindow.js";
+import { isValidTimeZone } from "./timezone.js";
 
 /** Pactly's only supported asset for now (matches `services/booking.ts`'s
  * own `DEPOSIT_ASSET_SYMBOL`). Every amount this module returns is shaped
@@ -387,8 +391,6 @@ export interface ProviderProfileView {
 export function buildProviderProfileView(
   profile: ProviderProfileRow,
   category: CategoryRow,
-  slots: AvailabilitySlotRow[],
-  reviews: ReviewView[] = [],
   slots: Array<Pick<AvailabilitySlotRow, "startsAt"> | number>,
 ): ProviderProfileView {
   let languages: string[] = [];
@@ -422,6 +424,8 @@ export function buildProviderProfileView(
     verifiedSessionCount: profile.verifiedSessionCount,
     providerCancellationCount: profile.providerCancellationCount,
     isApproved: profile.isApproved,
+    bookingsPaused: profile.bookingsPaused,
+    timezone: profile.timezone,
     slots: slots.map((slot) => (typeof slot === "number" ? slot : slot.startsAt)),
   };
 }
@@ -911,10 +915,18 @@ export async function listDiscoverProviders(
     return [];
   }
 
-  // Money filters: BigInt comparisons over the SQL layer's already-
-  // text/category/format-filtered rows (the I/O matrix's own "Price range"
-  // and "Deposit cap" rows) -- app.ts has already dropped a non-integer or
-  // out-of-bounds param, so every value reaching here is trusted.
+  // Issue #154: shops in a hidden category stay off discovery -- they are
+  // still reachable by their own direct URL (getPublicProviderProfile does
+  // not filter on category visibility). Filter them out here so they never
+  // appear in listings or search results.
+  const allCategories = await listCategories(db);
+  const visibleCategoryIds = new Set(
+    allCategories.filter((category) => category.visible).map((category) => category.id),
+  );
+  profiles = profiles.filter((profile) => visibleCategoryIds.has(profile.categoryId));
+  if (profiles.length === 0) {
+    return [];
+  }
   if (filters.minPriceAmount !== undefined || filters.maxPriceAmount !== undefined) {
     const min = filters.minPriceAmount !== undefined ? BigInt(filters.minPriceAmount) : undefined;
     const max = filters.maxPriceAmount !== undefined ? BigInt(filters.maxPriceAmount) : undefined;
@@ -933,7 +945,6 @@ export async function listDiscoverProviders(
     return [];
   }
 
-  const allCategories = await listCategories(db);
   const categoryById = new Map(allCategories.map((row) => [row.id, row]));
   const earliestSlotsByProvider = await listEarliestOfferedSlotsByProvider(
     db,
@@ -978,6 +989,7 @@ export async function listDiscoverProviders(
     );
   }
 
+  const weeklyPatternSlotsByProvider = new Map<string, number[]>();
   const cards = profiles.map((profile) => {
     const category = categoryById.get(profile.categoryId);
     if (!category) {
@@ -1133,13 +1145,13 @@ export async function suggestDiscoverQueries(db: Db, rawQuery: string): Promise<
   }
   const needle = query.toLowerCase();
 
-  const [allCategories, categoryCounts, approvedProfiles] = await Promise.all([
-    listCategories(db),
+  const [visibleCategories, categoryCounts, approvedProfiles] = await Promise.all([
+    listVisibleCategories(db),
     countApprovedProvidersByCategory(db),
     listApprovedProviderProfilesForDiscover(db),
   ]);
 
-  const categorySuggestions: DiscoverSuggestion[] = allCategories
+  const categorySuggestions: DiscoverSuggestion[] = visibleCategories
     .filter((category) => category.name.toLowerCase().includes(needle))
     .map((category) => ({
       kind: "category",
