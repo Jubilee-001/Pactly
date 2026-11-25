@@ -104,6 +104,7 @@ import {
   BookingEscrowStateError,
   BookingHoldExpiredError,
   BookingNotFoundError,
+  DisputeWindowClosedError,
   BookingsPausedError,
   InvalidDisputeReasonError,
   NothingToPayError,
@@ -241,10 +242,17 @@ export async function requirePactlyAuth(c: Context<{ Variables: Variables }>, ne
     return c.json({ code: "unauthorized", message: "Sign in required." }, 401);
   }
   try {
-    const { walletAddress } = await verifyPactlyJwt(token);
-    c.set("walletAddress", walletAddress);
+    const result = await verifyPactlyJwt(token);
+    c.set("walletAddress", result.walletAddress);
   } catch (error) {
     if (error instanceof PactlyJwtError) {
+      // Check if this was specifically an expired token
+      const cause = (error as Error).cause as Error | undefined;
+      const isExpired = cause && (cause.name === "JWTExpired" || cause.code === "ERR_JWT_EXPIRED");
+      
+      if (isExpired) {
+        return c.json({ code: "session_expired", message: "Session expired. Confirm again to continue." }, 401);
+      }
       return c.json({ code: "unauthorized", message: "Sign in required." }, 401);
     }
     throw error;
@@ -322,6 +330,11 @@ function parseDiscoverFilters(c: Context<{ Variables: Variables }>): DiscoverFil
   const when = c.req.query("when");
   if (when !== undefined && AVAILABILITY_FILTER_VALUES.has(when)) {
     filters.availability = when as "24h" | "week";
+  }
+
+  const sort = c.req.query("sort");
+  if (sort !== undefined && sort.trim().length > 0) {
+    filters.sort = sort.trim();
   }
 
   return filters;
@@ -793,8 +806,18 @@ export function createApp(db: Db, options: CreateAppOptions = {}): App {
   /** Approved profiles only; an unapproved or unknown id gives the same
    * 404 either way so nothing about an unapproved profile leaks. */
   app.get("/providers/:id", async (c) => {
+    let callerWalletAddress: string | undefined;
+    const authHeader = c.req.header("authorization");
+    if (authHeader?.startsWith("Bearer ")) {
+      try {
+        const { walletAddress } = await verifyPactlyJwt(authHeader.slice(7));
+        callerWalletAddress = walletAddress;
+      } catch {
+        // Optional auth: malformed or invalid token is simply ignored
+      }
+    }
     try {
-      const profile = await getPublicProviderProfile(db, c.req.param("id"));
+      const profile = await getPublicProviderProfile(db, c.req.param("id"), undefined, callerWalletAddress);
       return c.json(profile);
     } catch (error) {
       if (error instanceof ProviderNotFoundError) {
@@ -1003,6 +1026,7 @@ export function createApp(db: Db, options: CreateAppOptions = {}): App {
     try {
       const result = await closeProviderDate(db, c.get("walletAddress"), {
         date: typeof body?.date === "string" ? body.date : "",
+        ...(typeof body?.endDate === "string" ? { endDate: body.endDate } : {}),
         ...(typeof body?.tzOffsetMinutes === "number" ? { tzOffsetMinutes: body.tzOffsetMinutes } : {}),
       });
       return c.json(result);
@@ -1013,6 +1037,97 @@ export function createApp(db: Db, options: CreateAppOptions = {}): App {
       if (error instanceof NotAProviderError) {
         return c.json({ code: "NOT_A_PROVIDER", message: error.message }, 404);
       }
+      throw error;
+    }
+  });
+
+  const closedDateErrorResponse = (error: unknown, c: Context) => {
+    if (error instanceof NotAProviderError) {
+      return c.json({ code: "NOT_A_PROVIDER", message: error.message }, 404);
+    }
+    if (error instanceof InvalidClosedDateError) {
+      return c.json({ code: "INVALID_CLOSED_DATE", message: error.message, details: error.details }, 400);
+    }
+    if (error instanceof ClosedDateBookingError) {
+      return c.json(
+        {
+          code: "DATE_HAS_BOOKING",
+          message: error.message,
+          details: { bookingId: error.bookingId, slotStartsAt: error.slotStartsAt, escrowState: error.escrowState },
+        },
+        409,
+      );
+    }
+    return undefined;
+  };
+
+  app.get("/me/provider/closed-dates", requirePactlyAuth, async (c) => {
+    try {
+      return c.json({ closedDates: await listClosedDatesForWallet(db, c.get("walletAddress")) });
+    } catch (error) {
+      const mapped = closedDateErrorResponse(error, c);
+      if (mapped) return mapped;
+      throw error;
+    }
+  });
+
+  app.post("/me/provider/closed-dates", requirePactlyAuth, async (c) => {
+    const body = await c.req.json().catch(() => undefined);
+    try {
+      return c.json({ closedDates: await closeDate(db, c.get("walletAddress"), body?.date) });
+    } catch (error) {
+      const mapped = closedDateErrorResponse(error, c);
+      if (mapped) return mapped;
+      throw error;
+    }
+  });
+
+  app.put("/me/provider/closed-dates/:date", requirePactlyAuth, async (c) => {
+    try {
+      return c.json({ closedDates: await closeDate(db, c.get("walletAddress"), c.req.param("date")) });
+    } catch (error) {
+      const mapped = closedDateErrorResponse(error, c);
+      if (mapped) return mapped;
+      throw error;
+    }
+  });
+
+  app.delete("/me/provider/closed-dates/:date", requirePactlyAuth, async (c) => {
+    try {
+      return c.json({ closedDates: await reopenDate(db, c.get("walletAddress"), c.req.param("date")) });
+    } catch (error) {
+      const mapped = closedDateErrorResponse(error, c);
+      if (mapped) return mapped;
+      throw error;
+    }
+  });
+
+  app.get("/me/provider/availability/closed", requirePactlyAuth, async (c) => {
+    try {
+      return c.json({ closedDates: await listClosedDatesForWallet(db, c.get("walletAddress")) });
+    } catch (error) {
+      const mapped = closedDateErrorResponse(error, c);
+      if (mapped) return mapped;
+      throw error;
+    }
+  });
+
+  app.put("/me/provider/availability/closed/:date", requirePactlyAuth, async (c) => {
+    try {
+      return c.json({ closedDates: await closeDate(db, c.get("walletAddress"), c.req.param("date")) });
+    } catch (error) {
+      const mapped = closedDateErrorResponse(error, c);
+      if (mapped) return mapped;
+      throw error;
+    }
+  });
+
+  app.delete("/me/provider/availability/closed/:date", requirePactlyAuth, async (c) => {
+    try {
+      return c.json({ closedDates: await reopenDate(db, c.get("walletAddress"), c.req.param("date")) });
+    } catch (error) {
+      const mapped = closedDateErrorResponse(error, c);
+      if (mapped) return mapped;
       throw error;
     }
   });
@@ -1384,6 +1499,9 @@ export function createApp(db: Db, options: CreateAppOptions = {}): App {
       }
       if (error instanceof XdrMismatchError) {
         return c.json({ code: "XDR_MISMATCH", message: error.message }, 409);
+      }
+      if (error instanceof DisputeWindowClosedError) {
+        return c.json({ code: "DISPUTE_WINDOW_CLOSED", message: error.message }, 409);
       }
       if (error instanceof EscrowApiError || error instanceof EscrowRequestError || error instanceof EscrowConfigError) {
         const response = escrowErrorResponse(error);
@@ -2096,6 +2214,9 @@ app.get("/bookings/:id/ics", requirePactlyAuth, async (c) => {
       if (error instanceof InvalidDisputeReasonError) {
         return c.json({ code: "INVALID_REASON", message: error.message }, 400);
       }
+      if (error instanceof DisputeWindowClosedError) {
+        return c.json({ code: "DISPUTE_WINDOW_CLOSED", message: error.message }, 409);
+      }
       if (error instanceof BookingActionPendingError) {
         return c.json({ code: "ACTION_PENDING", message: error.message }, 409);
       }
@@ -2420,32 +2541,6 @@ app.get("/bookings/:id/ics", requirePactlyAuth, async (c) => {
     }
   });
 
-  // ---------------------------------------------------------------------
-  // Saved shops: a client's personal list of shops they want to book again.
-  // ---------------------------------------------------------------------
-
-  /** A signed-in client saves an approved shop. Idempotent. */
-  app.post("/providers/:id/save", requirePactlyAuth, async (c) => {
-    const providerProfileId = c.req.param("id");
-    if (!providerProfileId) {
-      return c.json({ code: "invalid_request", message: "provider id is required." }, 400);
-    }
-    try {
-      const now = Math.floor(Date.now() / 1000);
-      const result = await saveShop(db, c.get("walletAddress"), providerProfileId, now);
-      return c.json(result, 201);
-    } catch (error) {
-      if (error instanceof SavedShopNotFoundError) {
-        return c.json({ code: "SHOP_NOT_FOUND", message: error.message }, 404);
-      }
-      if (error instanceof ShopNotApprovedError) {
-        return c.json({ code: "SHOP_NOT_APPROVED", message: error.message }, 409);
-      }
-      throw error;
-    }
-  });
-
-  // ---------------------------------------------------------------------
   // Story 5.8: admin category management. Any admin wallet may create a
   // category or hide/show an existing one.
   // ---------------------------------------------------------------------
@@ -2535,6 +2630,32 @@ app.get("/bookings/:id/ics", requirePactlyAuth, async (c) => {
     }
   });
 
+  // ---------------------------------------------------------------------
+  // Saved shops: a client's personal list of shops they want to book again.
+  // ---------------------------------------------------------------------
+
+  /** A signed-in client saves an approved shop. Idempotent. */
+  app.post("/providers/:id/save", requirePactlyAuth, async (c) => {
+    const providerProfileId = c.req.param("id");
+    if (!providerProfileId) {
+      return c.json({ code: "invalid_request", message: "provider id is required." }, 400);
+    }
+
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      const result = await saveShop(db, c.get("walletAddress"), providerProfileId, now);
+      return c.json(result, 201);
+    } catch (error) {
+      if (error instanceof SavedShopNotFoundError) {
+        return c.json({ code: "SHOP_NOT_FOUND", message: error.message }, 404);
+      }
+      if (error instanceof ShopNotApprovedError) {
+        return c.json({ code: "SHOP_NOT_APPROVED", message: error.message }, 409);
+      }
+      throw error;
+    }
+  });
+
   /** A signed-in client unsaves a shop. */
   app.delete("/providers/:id/save", requirePactlyAuth, async (c) => {
     const providerProfileId = c.req.param("id");
@@ -2562,7 +2683,6 @@ app.get("/bookings/:id/ics", requirePactlyAuth, async (c) => {
     const shops = await getSavedShopsForClient(db, c.get("walletAddress"));
     return c.json({ shops });
   });
-
   /** Admins list all shop reports, newest first. */
   app.get("/admin/shop-reports", requirePactlyAuth, requireAdmin, async (c) => {
     const reports = await getShopReportsForAdmin(db);
