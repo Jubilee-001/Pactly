@@ -110,6 +110,15 @@ export function getProfileByWallet(db: Db, walletAddress: string): Promise<Provi
   return getProviderProfileByWallet(db, walletAddress);
 }
 
+/** Issue #158: the address a shop's escrow releases to. It is simply the
+ * wallet stored on the shop's profile -- never a newly generated key -- so
+ * the booking can show the same address the contract already pays. `null`
+ * only when the profile itself cannot be found. */
+export async function getProviderReceivingAddress(db: Db, providerProfileId: string): Promise<string | null> {
+  const profile = await getProfile(db, providerProfileId);
+  return profile?.walletAddress ?? null;
+}
+
 /** Only ever returns approved profiles -- the marketplace-listing rule
  * (PRD Story 4.1 AC4) enforced at the one place every discovery/search
  * route will call through. */
@@ -713,14 +722,6 @@ export async function updateProviderIntake(
     null,
   );
   // Update the profile's intake answers.
-  const intakeAnswersJson = JSON.stringify(
-    Object.entries(newAnswers).map(([questionId, { answer, isOptional }]) => ({
-      questionId,
-      answer: answer ?? null,
-      isOptional,
-    })),
-    null,
-  );
   // Use drizzle-orm to update the intake_answers column.
   await db
     .update(providerProfiles)

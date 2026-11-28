@@ -246,6 +246,9 @@ export interface BookingView {
    * refetch so the free-cancellation countdown stays aligned with the
    * clock that will accept or refuse a cancel. */
   serverTime: number;
+  /** UTC epoch seconds when the chain state was last reconciled successfully,
+   * or `null` if it has never been checked successfully. */
+  lastReconciledAt: number | null;
   provider: BookingProviderSummary;
   /** Story 3.7: the on-chain transaction hash once the balance was paid
    * through Pactly (`null` for unpaid or paid-in-cash) -- drives the
@@ -262,6 +265,9 @@ export interface BookingView {
    * Visible to the booking's client and provider, never on the public
    * profile or discovery. */
   lateNote: string | null;
+  /** Issue #158: the address stored for this booking's shop -- the escrow's
+   * receiver, shown (and copyable) for both sides. */
+  receivingAddress: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +319,9 @@ export interface BookingListItemBase {
   /** UTC epoch seconds -- when the provider marked the client as arrived,
    * `null` until marked. */
   arrivedAt: number | null;
+  /** Issue #158: the address stored for this booking's shop (the escrow's
+   * receiver), `null` only when the shop's profile is gone. */
+  receivingAddress: string | null;
 }
 
 export interface ClientBookingListItem extends BookingListItemBase {
@@ -331,8 +340,15 @@ export interface MyBookingsResponse {
   bookings: ClientBookingListItem[];
 }
 
+/** The provider dashboard's own wallet readiness: `null` when the read
+ * could not be answered, in which case no warning is shown. */
+export interface ProviderTrustlineStatus {
+  hasTrustline: boolean | null;
+}
+
 export interface ProviderBookingsResponse {
   bookings: ProviderBookingListItem[];
+  trustline: ProviderTrustlineStatus;
 }
 
 // ---------------------------------------------------------------------------
@@ -639,6 +655,70 @@ export interface AdminApplicationsResponse {
 export type ProviderApplicationOutcome = "approve" | "reject";
 
 // ---------------------------------------------------------------------------
+// Saved shops: a client's personal list of shops they want to book again.
+// ---------------------------------------------------------------------------
+
+export interface SaveShopResponse {
+  savedShopId: string;
+}
+
+export interface UnsaveShopResponse {
+  unsaved: boolean;
+}
+
+export interface IsShopSavedResponse {
+  isSaved: boolean;
+}
+
+export interface SavedShop {
+  id: string;
+  provider: {
+    id: string;
+    displayName: string;
+    title: string;
+    location: string;
+    categoryId: string;
+    sessionFormat: string;
+    sessionLengthMinutes: number;
+    priceAmount: string;
+    depositRateBps: number;
+    cancellationWindowHours: number;
+    isApproved: boolean;
+    verifiedSessionCount: number;
+  };
+  savedAt: number;
+}
+
+export interface SavedShopsResponse {
+  shops: SavedShop[];
+}
+
+// ---------------------------------------------------------------------------
+// Shop reports: clients can report a shop to admins.
+// ---------------------------------------------------------------------------
+
+export interface ShopReportSubmitResponse {
+  reportId: string;
+}
+
+export interface ShopReport {
+  id: string;
+  reason: string;
+  createdAt: number;
+  reportedByWallet: string;
+  provider: {
+    id: string;
+    displayName: string;
+    walletAddress: string;
+    isApproved: boolean;
+  };
+}
+
+export interface ShopReportsListResponse {
+  reports: ShopReport[];
+}
+
+// ---------------------------------------------------------------------------
 // Public booking proof (shareable, no sign-in)
 // ---------------------------------------------------------------------------
 
@@ -655,4 +735,8 @@ export interface ProofResponse {
   slotStartsAt: number | null;
   deposit: Money;
   contractId: string;
+  /** Issue #157: the transaction that moved the deposit, once the escrow
+   * has been released. `null` before release, and when a release happened
+   * without a stored hash (never the anchor cash-out id). */
+  releaseTxHash: string | null;
 }

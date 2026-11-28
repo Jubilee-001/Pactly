@@ -138,6 +138,7 @@ import {
   submitSignedTransaction,
   type BuildBalancePaymentDeps,
 } from "./services/booking.js";
+import { getProviderTrustlineStatus } from "./services/providerTrustline.js";
 import {
   BookingOutsideCancellationWindowError,
   InvalidCloseDateError,
@@ -146,6 +147,7 @@ import {
 } from "./services/availability.js";
 import { EscrowApiError, EscrowConfigError, EscrowRequestError } from "./escrow/trustless-work/errors.js";
 import { defaultEscrowAdapter } from "./escrow/trustless-work/client.js";
+import { realListEscrows, runReconcilerOnce, type ReconcilerDeps } from "./escrow/trustless-work/reconciler.js";
 import { TransactionStatusUnavailableError } from "./escrow/transaction-status.js";
 import type { EscrowAdapter } from "./escrow/interface.js";
 import { PaymentFailedError, PaymentUnavailableError } from "./payments/errors.js";
@@ -158,7 +160,13 @@ import {
 } from "./services/bookingsExport.js";
 import { config } from "./config.js";
 import { DISPUTE_OUTCOMES, type DisputeOutcome, type DisputeReason } from "./db/schema.js";
-import { getBookingById, setBookingNote, clearBookingNote, setLateNote } from "./db/bookings.js";
+import {
+  claimEscrowReconcileSync,
+  getBookingById,
+  setBookingNote,
+  clearBookingNote,
+  setLateNote,
+} from "./db/bookings.js";
 import {
   AmountOutOfRangeError,
   AnchorAuthError,
@@ -346,6 +354,10 @@ export interface CreateAppOptions {
    * to exercise `502 ESCROW_REJECTED`/accepted-deploy paths without a real
    * Trustless Work API key. */
   escrowAdapter?: EscrowAdapter;
+  /** Overrides the manual booking reconcile read for route-level tests. */
+  reconcilerListEscrows?: ReconcilerDeps["listEscrows"];
+  /** Overrides the platform-role check for manual reconcile tests. */
+  reconcilerPlatformAddress?: string;
   /** Story 3.7: overrides `POST /bookings/:id/balance/pay`'s own network
    * seams (how the client's account is loaded, how the USDC asset is
    * resolved) -- same "inject the network access" discipline as
@@ -767,6 +779,10 @@ export function createApp(db: Db, options: CreateAppOptions = {}): App {
       slotStartsAt: slot?.startsAt ?? null,
       deposit: { amount: booking.depositAmount, asset: "USDC" },
       contractId: booking.escrowContractId,
+      // Issue #157: the release's own transaction (once the chain has moved
+      // the deposit) -- never the anchor cash-out id, which is a different
+      // fact entirely.
+      releaseTxHash: booking.escrowReleaseTxHash,
     });
   });
 
@@ -1511,9 +1527,8 @@ export function createApp(db: Db, options: CreateAppOptions = {}): App {
     }
   });
 
-  /** Booking detail for the owning client. Includes `serverTime` (UTC epoch
-   * seconds) alongside `cancelDeadline` so the free-cancellation countdown
-   * can follow the server clock and resync on every poll/refetch. */
+  /** Booking detail for the owning client. Includes `serverTime` for the
+   * cancellation countdown and `lastReconciledAt` for chain-state freshness. */
   app.get("/bookings/:id", requirePactlyAuth, async (c) => {
     const bookingId = c.req.param("id");
     if (!bookingId) {
@@ -1525,6 +1540,54 @@ export function createApp(db: Db, options: CreateAppOptions = {}): App {
     } catch (error) {
       if (error instanceof BookingNotFoundError) {
         return c.json({ code: "BOOKING_NOT_FOUND", message: error.message }, 404);
+      }
+      throw error;
+    }
+  });
+
+  /** One authenticated, booking-scoped chain refresh. The timestamp is
+   * advanced only by a successful reconciler read; a failed network request
+   * leaves the booking's last known escrow state and timestamp untouched. */
+  app.post("/bookings/:id/reconcile", requirePactlyAuth, async (c) => {
+    const bookingId = c.req.param("id");
+    if (!bookingId) {
+      return c.json({ code: "invalid_request", message: "booking id is required." }, 400);
+    }
+    try {
+      const booking = await getBookingForClient(db, bookingId, c.get("walletAddress"));
+      if (!booking.escrowContractId) {
+        return c.json({ code: "BOOKING_STATE", message: "This booking has no escrow to refresh." }, 409);
+      }
+
+      const now = Math.floor(Date.now() / 1000);
+      if (!claimEscrowReconcileSync(db, bookingId, now)) {
+        c.header("Retry-After", "15");
+        return c.json(
+          { code: "RECONCILE_RATE_LIMITED", message: "Please wait before refreshing this booking again." },
+          429,
+        );
+      }
+
+      await runReconcilerOnce({
+        db,
+        bookingId,
+        now,
+        listEscrows: options.reconcilerListEscrows ?? realListEscrows(),
+        ...(options.reconcilerPlatformAddress !== undefined
+          ? { platformAddress: options.reconcilerPlatformAddress }
+          : {}),
+      });
+      return c.json(await getBookingView(db, bookingId, c.get("walletAddress"), now));
+    } catch (error) {
+      if (error instanceof BookingNotFoundError) {
+        return c.json({ code: "BOOKING_NOT_FOUND", message: error.message }, 404);
+      }
+      if (error instanceof EscrowApiError || error instanceof EscrowRequestError || error instanceof EscrowConfigError) {
+        const response = escrowErrorResponse(error);
+        return c.json(
+          { code: response.code, message: "The chain check failed. The last known booking status is unchanged." },
+          response.status,
+        );
       }
       throw error;
     }
@@ -1895,11 +1958,16 @@ app.get("/bookings/:id/ics", requirePactlyAuth, async (c) => {
   /** The provider panel's "Bookings" view: every booking against the
    * caller's own provider profile, ordered by appointment date. A wallet
    * with no provider profile gets the same `404 NOT_A_PROVIDER` every other
-   * `/me/provider` route already gives. */
+   * `/me/provider` route already gives. The response also carries the
+   * shop's own USDC trustline readiness so the dashboard can warn before a
+   * client discovers it by failing to lock; a failed check is `null` and
+   * never hides the bookings below it. */
   app.get("/me/provider/bookings", requirePactlyAuth, async (c) => {
+    const walletAddress = c.get("walletAddress");
     try {
-      const bookingsList = await listBookingsForProvider(db, c.get("walletAddress"));
-      return c.json({ bookings: bookingsList });
+      const bookingsList = await listBookingsForProvider(db, walletAddress);
+      const trustline = await getProviderTrustlineStatus(walletAddress, usdcTrustlineDeps);
+      return c.json({ bookings: bookingsList, trustline });
     } catch (error) {
       if (error instanceof NotAProviderError) {
         return c.json({ code: "NOT_A_PROVIDER", message: error.message }, 404);
@@ -2541,6 +2609,33 @@ app.get("/bookings/:id/ics", requirePactlyAuth, async (c) => {
     }
   });
 
+  // ---------------------------------------------------------------------
+  // Saved shops: a client's personal list of shops they want to book again.
+  // ---------------------------------------------------------------------
+
+  /** A signed-in client saves an approved shop. Idempotent. */
+  app.post("/providers/:id/save", requirePactlyAuth, async (c) => {
+    const providerProfileId = c.req.param("id");
+    if (!providerProfileId) {
+      return c.json({ code: "invalid_request", message: "provider id is required." }, 400);
+    }
+
+    try {
+      const now = Math.floor(Date.now() / 1000);
+      const result = await saveShop(db, c.get("walletAddress"), providerProfileId, now);
+      return c.json(result, 201);
+    } catch (error) {
+      if (error instanceof SavedShopNotFoundError) {
+        return c.json({ code: "SHOP_NOT_FOUND", message: error.message }, 404);
+      }
+      if (error instanceof ShopNotApprovedError) {
+        return c.json({ code: "SHOP_NOT_APPROVED", message: error.message }, 409);
+      }
+      throw error;
+    }
+  });
+
+  // ---------------------------------------------------------------------
   // Story 5.8: admin category management. Any admin wallet may create a
   // category or hide/show an existing one.
   // ---------------------------------------------------------------------
@@ -2600,7 +2695,6 @@ app.get("/bookings/:id/ics", requirePactlyAuth, async (c) => {
     if (!providerProfileId) {
       return c.json({ code: "invalid_request", message: "provider id is required." }, 400);
     }
-
     const body = await c.req.json().catch(() => undefined);
     const reason = typeof body?.reason === "string" ? body.reason : "";
 
@@ -2683,6 +2777,7 @@ app.get("/bookings/:id/ics", requirePactlyAuth, async (c) => {
     const shops = await getSavedShopsForClient(db, c.get("walletAddress"));
     return c.json({ shops });
   });
+
   /** Admins list all shop reports, newest first. */
   app.get("/admin/shop-reports", requirePactlyAuth, requireAdmin, async (c) => {
     const reports = await getShopReportsForAdmin(db);
